@@ -51,6 +51,13 @@ type ConvertOpenAIResponseToAnthropicParams struct {
 	ThinkingContentBlockIndex int
 	// Next available content block index
 	NextContentBlockIndex int
+
+	// ThinkTagOpen tracks whether we are currently inside a "<think>...</think>" section while
+	// translating providers that embed reasoning directly into the "content" stream.
+	ThinkTagOpen bool
+	// ThinkTagCarry stores a partial "<think>" or "</think>" tag prefix when the tag is split across
+	// streaming chunks. This enables correct reconstruction without leaking tag fragments to clients.
+	ThinkTagCarry string
 }
 
 // ToolCallAccumulator holds the state for accumulating tool call data
@@ -58,6 +65,188 @@ type ToolCallAccumulator struct {
 	ID        string
 	Name      string
 	Arguments strings.Builder
+}
+
+const (
+	thinkOpenTag  = "<think>"
+	thinkCloseTag = "</think>"
+)
+
+type contentSegment struct {
+	Thinking bool
+	Text     string
+}
+
+// shouldParseThinkTagsForModel reports whether this translator should reinterpret "<think>...</think>" tags
+// as Anthropic thinking blocks for the given model name.
+//
+// Root cause: Some providers may legitimately output literal "<think>" text (e.g., discussing XML/HTML or
+// showing code samples). Blindly parsing tags for every model would silently rewrite user-visible content.
+// Solution: Gate this compatibility behaviour to MiniMax models only (MiniMax-*), where we have observed
+// the upstream embedding reasoning in delta.content rather than "reasoning_content".
+func shouldParseThinkTagsForModel(model string) bool {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return false
+	}
+	return strings.HasPrefix(strings.ToLower(model), "minimax-")
+}
+
+// parseThinkTaggedText splits a string into ordered segments of normal text and "<think>...</think>" reasoning.
+//
+// Root cause: Some OpenAI-compatible providers (observed with MiniMax-M2.1) do not emit OpenAI-style
+// "reasoning_content" fields. Instead, they stream reasoning inside delta.content using "<think>...</think>" tags.
+// The existing OpenAI->Anthropic translator only maps "reasoning_content" to Anthropic "thinking" content blocks,
+// so downstream Anthropic clients see no thinking (and may hide the tagged text).
+//
+// Solution: Detect and parse "<think>...</think>" sections and convert them into Anthropic "thinking" blocks,
+// while emitting the remaining text as regular Anthropic "text" blocks, preserving the original stream order.
+func parseThinkTaggedText(text string, initialThinkOpen bool) (segments []contentSegment, thinkOpen bool) {
+	thinkOpen = initialThinkOpen
+	remaining := text
+
+	appendSegment := func(thinking bool, value string) {
+		if strings.TrimSpace(value) == "" {
+			return
+		}
+		segments = append(segments, contentSegment{Thinking: thinking, Text: value})
+	}
+
+	for remaining != "" {
+		if !thinkOpen {
+			openIdx := strings.Index(remaining, thinkOpenTag)
+			closeIdx := strings.Index(remaining, thinkCloseTag)
+
+			// Handle stray close tags by dropping them while preserving surrounding text.
+			if closeIdx != -1 && (openIdx == -1 || closeIdx < openIdx) {
+				appendSegment(false, remaining[:closeIdx])
+				remaining = remaining[closeIdx+len(thinkCloseTag):]
+				continue
+			}
+
+			if openIdx == -1 {
+				appendSegment(false, remaining)
+				return segments, thinkOpen
+			}
+
+			appendSegment(false, remaining[:openIdx])
+			remaining = remaining[openIdx+len(thinkOpenTag):]
+			thinkOpen = true
+			continue
+		}
+
+		// thinkOpen == true
+		closeIdx := strings.Index(remaining, thinkCloseTag)
+		if closeIdx == -1 {
+			appendSegment(true, remaining)
+			return segments, thinkOpen
+		}
+		appendSegment(true, remaining[:closeIdx])
+		remaining = remaining[closeIdx+len(thinkCloseTag):]
+		thinkOpen = false
+	}
+
+	return segments, thinkOpen
+}
+
+// splitTrailingThinkTagPrefix removes and returns a partial "<think>" or "</think>" prefix at the end of s.
+// This supports cases where the provider splits a tag across streaming chunks.
+func splitTrailingThinkTagPrefix(s string) (processed string, carry string) {
+	processed = s
+	carry = ""
+	if s == "" {
+		return processed, carry
+	}
+
+	maxPrefix := len(thinkCloseTag) - 1
+	if openMax := len(thinkOpenTag) - 1; openMax > maxPrefix {
+		maxPrefix = openMax
+	}
+	if maxPrefix <= 0 {
+		return processed, carry
+	}
+	if len(s) < maxPrefix {
+		maxPrefix = len(s)
+	}
+
+	for i := maxPrefix; i >= 1; i-- {
+		openPrefix := thinkOpenTag[:i]
+		closePrefix := thinkCloseTag[:i]
+		if strings.HasSuffix(s, openPrefix) || strings.HasSuffix(s, closePrefix) {
+			return s[:len(s)-i], s[len(s)-i:]
+		}
+	}
+	return processed, carry
+}
+
+// parseThinkTaggedStreamDelta parses a streaming delta.content string into ordered thinking/text segments,
+// carrying incomplete "<think>" or "</think>" prefixes across chunks.
+func parseThinkTaggedStreamDelta(param *ConvertOpenAIResponseToAnthropicParams, delta string) []contentSegment {
+	if param == nil {
+		segments, _ := parseThinkTaggedText(delta, false)
+		return segments
+	}
+
+	combined := param.ThinkTagCarry + delta
+	param.ThinkTagCarry = ""
+
+	processed, carry := splitTrailingThinkTagPrefix(combined)
+	param.ThinkTagCarry = carry
+
+	segments, thinkOpen := parseThinkTaggedText(processed, param.ThinkTagOpen)
+	param.ThinkTagOpen = thinkOpen
+	return segments
+}
+
+func emitThinkingDelta(param *ConvertOpenAIResponseToAnthropicParams, results *[]string, text string) {
+	if param == nil || results == nil {
+		return
+	}
+	if strings.TrimSpace(text) == "" {
+		return
+	}
+	stopTextContentBlock(param, results)
+	if !param.ThinkingContentBlockStarted {
+		if param.ThinkingContentBlockIndex == -1 {
+			param.ThinkingContentBlockIndex = param.NextContentBlockIndex
+			param.NextContentBlockIndex++
+		}
+		contentBlockStartJSON := `{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}`
+		contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "index", param.ThinkingContentBlockIndex)
+		*results = append(*results, "event: content_block_start\ndata: "+contentBlockStartJSON+"\n\n")
+		param.ThinkingContentBlockStarted = true
+	}
+
+	thinkingDeltaJSON := `{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}`
+	thinkingDeltaJSON, _ = sjson.Set(thinkingDeltaJSON, "index", param.ThinkingContentBlockIndex)
+	thinkingDeltaJSON, _ = sjson.Set(thinkingDeltaJSON, "delta.thinking", text)
+	*results = append(*results, "event: content_block_delta\ndata: "+thinkingDeltaJSON+"\n\n")
+}
+
+func emitTextDelta(param *ConvertOpenAIResponseToAnthropicParams, results *[]string, text string) {
+	if param == nil || results == nil {
+		return
+	}
+	if strings.TrimSpace(text) == "" {
+		return
+	}
+	if !param.TextContentBlockStarted {
+		stopThinkingContentBlock(param, results)
+		if param.TextContentBlockIndex == -1 {
+			param.TextContentBlockIndex = param.NextContentBlockIndex
+			param.NextContentBlockIndex++
+		}
+		contentBlockStartJSON := `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`
+		contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "index", param.TextContentBlockIndex)
+		*results = append(*results, "event: content_block_start\ndata: "+contentBlockStartJSON+"\n\n")
+		param.TextContentBlockStarted = true
+	}
+
+	contentDeltaJSON := `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}`
+	contentDeltaJSON, _ = sjson.Set(contentDeltaJSON, "index", param.TextContentBlockIndex)
+	contentDeltaJSON, _ = sjson.Set(contentDeltaJSON, "delta.text", text)
+	*results = append(*results, "event: content_block_delta\ndata: "+contentDeltaJSON+"\n\n")
+	param.ContentAccumulator.WriteString(text)
 }
 
 // ConvertOpenAIResponseToClaude converts OpenAI streaming response format to Anthropic API format.
@@ -130,6 +319,7 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 	// Emit message_start on the very first chunk, regardless of whether it has a role field.
 	// Some providers (like Copilot) may send tool_calls in the first chunk without a role field.
 	if delta := root.Get("choices.0.delta"); delta.Exists() {
+		hasReasoningDelta := false
 		if !param.MessageStarted {
 			// Send message_start event
 			messageStartJSON := `{"type":"message_start","message":{"id":"","type":"message","role":"assistant","model":"","content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":0,"output_tokens":0}}}`
@@ -143,6 +333,7 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 
 		// Handle reasoning content delta
 		if reasoning := delta.Get("reasoning_content"); reasoning.Exists() {
+			hasReasoningDelta = true
 			for _, reasoningText := range collectOpenAIReasoningTexts(reasoning) {
 				if reasoningText == "" {
 					continue
@@ -168,26 +359,20 @@ func convertOpenAIStreamingChunkToAnthropic(rawJSON []byte, param *ConvertOpenAI
 
 		// Handle content delta
 		if content := delta.Get("content"); content.Exists() && content.String() != "" {
-			// Send content_block_start for text if not already sent
-			if !param.TextContentBlockStarted {
-				stopThinkingContentBlock(param, &results)
-				if param.TextContentBlockIndex == -1 {
-					param.TextContentBlockIndex = param.NextContentBlockIndex
-					param.NextContentBlockIndex++
+			// Only apply "<think>...</think>" parsing when OpenAI-style reasoning_content isn't present
+			// to avoid duplicating thinking output in the Anthropic stream.
+			if !hasReasoningDelta && shouldParseThinkTagsForModel(param.Model) {
+				segments := parseThinkTaggedStreamDelta(param, content.String())
+				for _, seg := range segments {
+					if seg.Thinking {
+						emitThinkingDelta(param, &results, seg.Text)
+					} else {
+						emitTextDelta(param, &results, seg.Text)
+					}
 				}
-				contentBlockStartJSON := `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`
-				contentBlockStartJSON, _ = sjson.Set(contentBlockStartJSON, "index", param.TextContentBlockIndex)
-				results = append(results, "event: content_block_start\ndata: "+contentBlockStartJSON+"\n\n")
-				param.TextContentBlockStarted = true
+			} else {
+				emitTextDelta(param, &results, content.String())
 			}
-
-			contentDeltaJSON := `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":""}}`
-			contentDeltaJSON, _ = sjson.Set(contentDeltaJSON, "index", param.TextContentBlockIndex)
-			contentDeltaJSON, _ = sjson.Set(contentDeltaJSON, "delta.text", content.String())
-			results = append(results, "event: content_block_delta\ndata: "+contentDeltaJSON+"\n\n")
-
-			// Accumulate content
-			param.ContentAccumulator.WriteString(content.String())
 		}
 
 		// Handle tool calls
@@ -376,7 +561,8 @@ func convertOpenAINonStreamingToAnthropic(rawJSON []byte) []string {
 		choice := choices.Array()[0] // Take first choice
 
 		reasoningNode := choice.Get("message.reasoning_content")
-		for _, reasoningText := range collectOpenAIReasoningTexts(reasoningNode) {
+		reasoningTexts := collectOpenAIReasoningTexts(reasoningNode)
+		for _, reasoningText := range reasoningTexts {
 			if reasoningText == "" {
 				continue
 			}
@@ -387,9 +573,25 @@ func convertOpenAINonStreamingToAnthropic(rawJSON []byte) []string {
 
 		// Handle text content
 		if content := choice.Get("message.content"); content.Exists() && content.String() != "" {
-			block := `{"type":"text","text":""}`
-			block, _ = sjson.Set(block, "text", content.String())
-			out, _ = sjson.SetRaw(out, "content.-1", block)
+			// Only attempt "<think>...</think>" parsing when "reasoning_content" is absent/empty.
+			if len(reasoningTexts) == 0 && shouldParseThinkTagsForModel(root.Get("model").String()) {
+				segments, _ := parseThinkTaggedText(content.String(), false)
+				for _, seg := range segments {
+					if seg.Thinking {
+						block := `{"type":"thinking","thinking":""}`
+						block, _ = sjson.Set(block, "thinking", seg.Text)
+						out, _ = sjson.SetRaw(out, "content.-1", block)
+						continue
+					}
+					block := `{"type":"text","text":""}`
+					block, _ = sjson.Set(block, "text", seg.Text)
+					out, _ = sjson.SetRaw(out, "content.-1", block)
+				}
+			} else {
+				block := `{"type":"text","text":""}`
+				block, _ = sjson.Set(block, "text", content.String())
+				out, _ = sjson.SetRaw(out, "content.-1", block)
+			}
 		}
 
 		// Handle tool calls
