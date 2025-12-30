@@ -14,6 +14,57 @@ import (
 	"github.com/tidwall/sjson"
 )
 
+const (
+	claudeCodeSystemMarker = "You are Claude Code, Anthropic's official CLI for Claude."
+
+	// claudeCodeAgentContinuationInstruction nudges non-Claude models to behave more like Claude Code's agent loop.
+	//
+	// Root cause: When using MiniMax (OpenAI-compat) as an Anthropic /v1/messages backend for Claude Code,
+	// the model may prematurely end its turn (stop_reason=end_turn) after printing a phase/stage header,
+	// rather than continuing with the next tool call. Claude Code expects the assistant to either emit the next
+	// required tool call (stop_reason=tool_use) or finish the stage, so an early end_turn forces the user to
+	// manually type "continue" to proceed.
+	//
+	// Solution: Inject a small, scoped system instruction ONLY for MiniMax models when the upstream request is
+	// clearly a Claude Code session. This reduces premature end_turns by explicitly asking the model to proceed
+	// and emit tool calls when needed, without affecting general Anthropic clients.
+	claudeCodeAgentContinuationInstruction = "" +
+		"You are acting as Claude Code's agent loop.\n" +
+		"IMPORTANT:\n" +
+		"- Do NOT stop after announcing a stage/phase header (e.g., \"Stage 3: Plan Phase\").\n" +
+		"- If the next step requires running a tool, emit the tool call immediately (stop_reason=tool_use) instead of waiting for the user to type \"continue\".\n" +
+		"- Only end your turn when you have either (a) completed the requested stage output, or (b) emitted the next required tool call.\n"
+)
+
+// isMiniMaxModel reports whether the model name is a MiniMax model (MiniMax-*).
+func isMiniMaxModel(model string) bool {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return false
+	}
+	return strings.HasPrefix(strings.ToLower(model), "minimax-")
+}
+
+// isClaudeCodeRequest reports whether an Anthropic request appears to come from Claude Code.
+// It uses a stable marker string present in Claude Code's default system prompt.
+func isClaudeCodeRequest(root gjson.Result) bool {
+	system := root.Get("system")
+	if !system.Exists() {
+		return false
+	}
+	if system.Type == gjson.String {
+		return strings.Contains(system.String(), claudeCodeSystemMarker)
+	}
+	if system.IsArray() {
+		for _, part := range system.Array() {
+			if strings.Contains(part.Get("text").String(), claudeCodeSystemMarker) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // ConvertClaudeRequestToOpenAI parses and transforms an Anthropic API request into OpenAI Chat Completions API format.
 // It extracts the model name, system instruction, message contents, and tool declarations
 // from the raw JSON request and returns them in the format expected by the OpenAI API.
@@ -23,6 +74,7 @@ func ConvertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 	out := `{"model":"","messages":[]}`
 
 	root := gjson.ParseBytes(rawJSON)
+	isClaudeCode := isClaudeCodeRequest(root)
 
 	// Model mapping
 	out, _ = sjson.Set(out, "model", modelName)
@@ -106,6 +158,14 @@ func ConvertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 				}
 			}
 		}
+	}
+
+	// Claude Code compatibility: encourage MiniMax to continue the agent loop and emit tool calls
+	// rather than ending the turn early and requiring the user to type "continue".
+	if isMiniMaxModel(modelName) && isClaudeCode {
+		injected := `{"type":"text","text":""}`
+		injected, _ = sjson.Set(injected, "text", claudeCodeAgentContinuationInstruction)
+		systemMsgJSON, _ = sjson.SetRaw(systemMsgJSON, "content.-1", injected)
 	}
 	messagesJSON, _ = sjson.SetRaw(messagesJSON, "-1", systemMsgJSON)
 
@@ -246,6 +306,21 @@ func ConvertClaudeRequestToOpenAI(modelName string, inputRawJSON []byte, stream 
 		default:
 			// Default to auto if not specified
 			out, _ = sjson.Set(out, "tool_choice", "auto")
+		}
+	}
+
+	// Claude Code compatibility: for MiniMax models, tool calling reliability can vary even when tools are
+	// provided and the system prompt requests the agent loop to proceed. When Claude Code is driving the
+	// conversation, ending with stop_reason=end_turn right after a stage header often stalls the workflow.
+	//
+	// Root cause: MiniMax (OpenAI-compat) may decide to end its turn (finish_reason=stop) instead of emitting
+	// a tool call, even when the next step requires a tool, which breaks Claude Code's expected loop.
+	// Solution: If (and only if) the request is a Claude Code session, the model is MiniMax, tools are present,
+	// and the client did not explicitly set tool_choice, force OpenAI tool_choice="required" so the model must
+	// emit a tool call rather than prematurely ending its turn.
+	if isMiniMaxModel(modelName) && isClaudeCode && !root.Get("tool_choice").Exists() {
+		if tools := root.Get("tools"); tools.Exists() && tools.IsArray() && len(tools.Array()) > 0 {
+			out, _ = sjson.Set(out, "tool_choice", "required")
 		}
 	}
 
